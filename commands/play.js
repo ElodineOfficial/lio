@@ -89,32 +89,34 @@ async function playSong(guild, song, client) {
     const serverQueue = client.queue.get(guild.id);
 
     if (!song) {
-        serverQueue.connection.destroy();
-        client.queue.delete(guild.id);
+        // Keep the connection alive, but stop playing
+        serverQueue.player.stop();
         return;
     }
 
-	const streamOptions = { filter: 'audioonly', highWaterMark: 131072, quality: 'highestaudio' }; // 128KB
+const streamOptions = { 
+    filter: 'audioonly', 
+    highWaterMark: 32 * 1024 // 32KB
+    // Omit 'quality' to allow automatic selection
+};
+
+
+
     const stream = ytdl(song.url, streamOptions);
     const resource = createAudioResource(stream, { 
         inputType: StreamType.Arbitrary,
-        inlineVolume: true // Enables volume control
+        inlineVolume: true 
     });
-    resource.volume.setVolume(2.0); // Set volume level here (1.0 is 100% volume)
+    resource.volume.setVolume(2.0); 
 
     serverQueue.player.play(resource);
 
     serverQueue.player.once(AudioPlayerStatus.Idle, async () => {
-        if (serverQueue.songs.length > 1) {
+        if (serverQueue.songs.length > 0) {
             serverQueue.history.push(serverQueue.songs.shift());
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            playSong(guild, serverQueue.songs[0], client);
-        } else if (serverQueue.songs.length === 1) {
-            await handleEmptyQueue(client, guild);
             playSong(guild, serverQueue.songs[0], client);
         } else {
-            serverQueue.connection.destroy();
-            client.queue.delete(guild.id);
+            await handleEmptyQueue(client, guild);
         }
     });
 
@@ -124,8 +126,8 @@ async function playSong(guild, song, client) {
         if (serverQueue.songs.length > 0) {
             playSong(guild, serverQueue.songs[0], client);
         } else {
-            serverQueue.connection.destroy();
-            client.queue.delete(guild.id);
+            // Keep the connection alive, but stop playing
+            serverQueue.player.stop();
         }
     });
 }
@@ -164,7 +166,7 @@ async function handleEmptyQueue(client, guild) {
         }
 
         // If not already playing, start playing the first song
-        if (!serverQueue.player.state.status === AudioPlayerStatus.Playing) {
+        if (serverQueue.player.state.status !== AudioPlayerStatus.Playing && serverQueue.songs.length > 0) {
             playSong(guild, serverQueue.songs[0], client);
         }
 
@@ -212,3 +214,5 @@ async function fetchNewPlaylist(prompt, client) {
     }
 }
 
+// Add this at the end of your play.js file
+module.exports.playSong = playSong;
