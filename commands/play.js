@@ -4,6 +4,8 @@ const { ChannelType } = require('discord.js'); // Corrected import
 const ytdl = require('ytdl-core');
 const YouTube = require('youtube-sr').default;
 const fs = require('fs').promises;
+const { Readable } = require('stream');
+
 
 let fetch;
 
@@ -70,6 +72,10 @@ module.exports = {
                     adapterCreator: message.guild.voiceAdapterCreator,
                 });
                 serverQueue.player = createAudioPlayer();
+				
+				
+				serverQueue.player.setMaxListeners(20);
+
                 serverQueue.connection.subscribe(serverQueue.player);
                 
                 playSong(message.guild, serverQueue.songs[0], client);
@@ -85,22 +91,26 @@ module.exports = {
     },
 };
 
+
 async function playSong(guild, song, client) {
+    console.log(`Attempting to play song: ${song?.title}`);
     const serverQueue = client.queue.get(guild.id);
 
     if (!song) {
-        // Keep the connection alive, but stop playing
-        serverQueue.player.stop();
+        // Queue is empty, play TTS message
+        console.log("Queue is empty, playing TTS message");
+        await playTTSMessage(client, guild.id, "Fetching new playlist, please wait...");
+
+        // After TTS message, fetch new playlist and play
+        await handleEmptyQueue(client, guild);
         return;
     }
 
-const streamOptions = { 
-    filter: 'audioonly', 
-    highWaterMark: 32 * 1024 // 32KB
-    // Omit 'quality' to allow automatic selection
-};
-
-
+    const streamOptions = { 
+        filter: 'audioonly', 
+        highWaterMark: 32 * 1024 // 32KB
+        // Omit 'quality' to allow automatic selection
+    };
 
     const stream = ytdl(song.url, streamOptions);
     const resource = createAudioResource(stream, { 
@@ -108,79 +118,77 @@ const streamOptions = {
         inlineVolume: true 
     });
     resource.volume.setVolume(2.0); 
-
     serverQueue.player.play(resource);
 
     serverQueue.player.once(AudioPlayerStatus.Idle, async () => {
-        if (serverQueue.songs.length > 0) {
-            serverQueue.history.push(serverQueue.songs.shift());
-            playSong(guild, serverQueue.songs[0], client);
+        serverQueue.history.push(serverQueue.songs.shift());
+        const nextSong = serverQueue.songs[0];
+
+        if (nextSong) {
+            playSong(guild, nextSong, client);
         } else {
+            console.log("Reached end of queue, fetching new playlist...");
             await handleEmptyQueue(client, guild);
         }
     });
 
     serverQueue.player.on('error', error => {
         console.error('Error in serverQueue.player:', error);
-        serverQueue.songs.shift();
-        if (serverQueue.songs.length > 0) {
-            playSong(guild, serverQueue.songs[0], client);
-        } else {
-            // Keep the connection alive, but stop playing
-            serverQueue.player.stop();
-        }
+        // Handle error, perhaps by skipping to the next song or resetting the player
     });
 }
 
 
+// Make sure to define elevenLabsTTS and handleEmptyQueue functions properly.
+
+// Inside an appropriate part of your bot's code
+const guildId = '1179095447466426498'; // Replace with actual guild ID
+
 async function handleEmptyQueue(client, guild) {
-    try {
-        const promptText = await fs.readFile('newplaylist.txt', 'utf8');
-        const prompt = [{ role: "system", content: promptText }];
-        const commands = await fetchNewPlaylist(prompt, client);
+    const guildId = guild.id;
 
-        const serverQueue = client.queue.get(guild.id);
+    const promptText = await fs.readFile('newplaylist.txt', 'utf8');
+    const prompt = [{ role: "system", content: promptText }];
+    const { commands, responseText } = await fetchNewPlaylist(prompt, client);
 
-        if (!serverQueue) {
-            console.error('No server queue found for guild');
-            return;
+    // Play TTS message with response text
+    await playTTSMessage(client, guildId, responseText);
+
+    console.log("Handling empty queue...");
+    const serverQueue = client.queue.get(guild.id);
+
+    if (!serverQueue) {
+        console.error('No server queue found for guild');
+        return;
+    }
+
+    for (const songName of commands) {
+        console.log(`Attempting to add to queue: ${songName}`);
+        const searchResults = await YouTube.search(songName, { limit: 1 });
+        if (searchResults.length === 0) {
+            console.error(`No results found for: ${songName}`);
+            continue;
         }
 
-        for (const songName of commands) {
-            // Fetch song details like URL and title
-            const searchResults = await YouTube.search(songName, { limit: 1 });
-            if (searchResults.length === 0) {
-                console.error(`No results found for: ${songName}`);
-                continue; // Skip to the next song if no results found
-            }
+        const song = {
+            url: searchResults[0].url,
+            title: searchResults[0].title
+        };
 
-            const song = {
-                url: searchResults[0].url,
-                title: searchResults[0].title
-            };
+        serverQueue.songs.push(song);
+        console.log(`Added to queue from new playlist: ${song.title}`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 
-            serverQueue.songs.push(song);
-            console.log(`Added to queue from new playlist: ${song.title}`);
-
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Delay between each addition
-        }
-
-        // If not already playing, start playing the first song
-        if (serverQueue.player.state.status !== AudioPlayerStatus.Playing && serverQueue.songs.length > 0) {
-            playSong(guild, serverQueue.songs[0], client);
-        }
-
-    } catch (error) {
-        console.error('Error handling empty queue:', error);
+    if (serverQueue.player.state.status !== AudioPlayerStatus.Playing && serverQueue.songs.length > 0) {
+        playSong(guild, serverQueue.songs[0], client);
     }
 }
 
 
 
-
-
-// This function now returns an array of commands extracted from the response
 async function fetchNewPlaylist(prompt, client) {
+    console.log("Fetching new playlist...");
     try {
         const response = await fetch('https://api.openai.com/v1/chat/completions', {
             method: 'POST',
@@ -197,8 +205,8 @@ async function fetchNewPlaylist(prompt, client) {
         });
         const data = await response.json();
         const responseText = data.choices[0].message.content;
-        
-        // Extract commands from the response
+        console.log("Fetched new playlist successfully.");
+
         const commandRegex = /!play\s+([\s\S]+?)(?=$|!play\s+)/g;
         let match;
         let commands = [];
@@ -207,12 +215,63 @@ async function fetchNewPlaylist(prompt, client) {
             commands.push(match[1].trim());
         }
 
-        return commands;
+        return { commands, responseText };
     } catch (error) {
         console.error('Error fetching new playlist:', error);
-        return [];
+        return { commands: [], responseText: "" };
     }
 }
 
+
+
 // Add this at the end of your play.js file
 module.exports.playSong = playSong;
+
+
+
+async function elevenLabsTTS(text) {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM/stream`; // Replace with your voice ID
+    const requestOptions = {
+        method: 'POST',
+        headers: {
+            'xi-api-key': process.env.ELEVENLABS_API_KEY,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model_id: "eleven_multilingual_v2", // Replace with your model id
+            text: text,
+            voice_settings: {
+                similarity_boost: 1,
+                stability: 1,
+                style: 1,
+                use_speaker_boost: true
+            }
+        })
+    };
+
+    const response = await fetch(url, requestOptions);
+    const buffer = await response.arrayBuffer();
+    return buffer;
+}
+
+
+
+async function playTTSMessage(client, guildId, message) {
+    const buffer = await elevenLabsTTS(message);
+    const readableStream = new Readable();
+    readableStream._read = () => {}; 
+    readableStream.push(Buffer.from(buffer));
+    readableStream.push(null);
+
+    const resource = createAudioResource(readableStream, { inputType: StreamType.Arbitrary });
+    const serverQueue = client.queue.get(guildId);
+
+    if (serverQueue && serverQueue.connection && serverQueue.player) {
+        serverQueue.player.play(resource);
+        return new Promise((resolve) => {
+            serverQueue.player.once(AudioPlayerStatus.Idle, () => {
+                resolve();
+            });
+        });
+    }
+}
