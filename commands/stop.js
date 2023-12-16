@@ -1,6 +1,9 @@
+const fs = require('fs');
+const path = require('path');
+
 module.exports = {
     name: 'stop',
-    description: 'Stop the music, clear the queue, and disconnect from the voice channel',
+    description: 'Stop the music, clear the queue, disconnect from the voice channel, and clear the cache',
     execute(message, args, client) {
         const serverQueue = client.queue.get(message.guild.id);
 
@@ -22,8 +25,26 @@ module.exports = {
             serverQueue.connection = null;
         }
 
+        // Delete the guild from the queue
         client.queue.delete(message.guild.id);
 
-        message.channel.send('Stopped the music, cleared the queue, and disconnected.');
+        // Clear the download cache
+        clearDownloadCache();
+
+        message.channel.send('Stopped the music, cleared the queue, disconnected, and cleared the cache.');
     }
 };
+
+function clearDownloadCache() {
+    const cacheDir = './cache'; // Adjust if your cache directory is different
+
+    fs.readdir(cacheDir, (err, files) => {
+        if (err) throw err;
+
+        for (const file of files) {
+            fs.unlink(path.join(cacheDir, file), err => {
+                if (err) throw err;
+            });
+        }
+    });
+}

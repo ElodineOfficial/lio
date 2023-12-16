@@ -1,5 +1,3 @@
-The playlist is empty. Please add 10 new songs.
-
 You have the ability to use commands. Yes, you do. Below are a list of commands and what they do.
 
 !play will add songs to the playlist.
