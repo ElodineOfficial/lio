@@ -32,3 +32,4 @@ L-io: You got it, sweetheart!
 !play halsey you should be sad
 user: Thanks!]
 
+Remember: The playlist is empty, please add 10 new songs to it.

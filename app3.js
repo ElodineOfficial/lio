@@ -1,41 +1,64 @@
 // Import necessary libraries
-const { Client, GatewayIntentBits, Collection } = require('discord.js');
-const fs = require('fs'); // Import the fs module for synchronous methods
-const fsp = fs.promises; // Use fs.promises for asynchronous methods
+const { Client, GatewayIntentBits, Collection, Partials } = require('discord.js');
+const fs = require('fs');
+const fsp = fs.promises;
 const allowedChannels = ['Frequency Funhouse'];
 require('dotenv').config();
+const { SlashCommandBuilder } = require('@discordjs/builders');
+const testevent = require('./events/testevent');
+const path = require('path');
+const { scheduleYouTubePlayback } = require('./events/testevent');
+const { Readable } = require('stream');
+const { playSong, playDownloadedSong, handleEmptyQueue } = require('./commands/play');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
+
+
+
 
 let fetch;
-
 (async () => {
     fetch = (await import('node-fetch')).default;
 })();
 
-
-// Create a new Discord client with the specified intents
+// Create a new Discord client with the specified intents and partials
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates // Keep this if needed
-    ]
+        GatewayIntentBits.GuildVoiceStates
+    ],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-// Initialize the recently played songs log
-client.recentlyPlayed = [];
+// Initialize client.queue here
+client.queue = new Map();
 
-// Command collection
+client.isFetchingOpenAIPlaylist = false;
+client.recentlyPlayed = [];
 client.commands = new Collection();
 
-// Load commands
+client.once('ready', () => {
+    console.log(`Logged in as ${client.user.tag}!`);
+ });
+
+
+
+// Load prefix-based (!command) commands
 const commandFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'));
+
 for (const file of commandFiles) {
     const command = require(`./commands/${file}`);
-    client.commands.set(command.name, command);
-    console.log(`Loaded command: ${command.name}`); // Add this line
-
+    // Check if command has 'name' property or 'data.name' property
+    if (command.name) {
+        client.commands.set(command.name, command);
+    } else if (command.data && command.data.name) {
+        client.commands.set(command.data.name, command);
+    } else {
+        console.error(`Command file ${file} is not properly formatted.`);
+    }
 }
+
 
 // Load events
 const eventFiles = fs.readdirSync('./events').filter(file => file.endsWith('.js'));
@@ -48,14 +71,41 @@ for (const file of eventFiles) {
     }
 }
 
+// Handle interactionCreate event for slash commands
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isCommand()) return;
+    const command = client.commands.get(interaction.commandName);
+    if (!command) return;
+
+    try {
+        await command.execute(interaction, client);
+    } catch (error) {
+        console.error(error);
+        await interaction.reply({ content: 'There was an error executing this command!', ephemeral: true });
+    }
+});
+
 // Additional variables from the new script
 const recentMessages = new Map();
 const maxMessages = 10;
 const cooldown = 60000;
 let lastResponseTime = 0;
 
-
 client.on('messageCreate', async message => {
+    const guildId = process.env.GUILD_ID || message.guild.id; // Use guild ID from .env file or fallback to message.guild.id
+        let serverQueue = client.queue.get(guildId);
+    if (!serverQueue) {
+        serverQueue = {
+            songs: [],
+            history: [],
+            connection: null,
+            player: null,
+            playing: true,
+            client: client // Storing client reference in serverQueue
+        };
+            client.queue.set(guildId, serverQueue);
+    }
+
     if (message.author.bot) return;
     if (!allowedChannels.includes(message.channel.name)) return;
 
@@ -63,7 +113,6 @@ client.on('messageCreate', async message => {
     const lines = message.content.split('\n');
 
     for (const line of lines) {
-        // Process each line that starts with '!'
         if (line.startsWith('!')) {
             const args = line.slice(1).trim().split(/ +/);
             const commandName = args.shift().toLowerCase();
@@ -73,7 +122,6 @@ client.on('messageCreate', async message => {
 
             try {
                 await command.execute(message, args, client);
-                await new Promise(resolve => setTimeout(resolve, 1000)); // Delay of 1 second
             } catch (error) {
                 console.error(error);
                 await message.reply('There was an error trying to execute that command!');
@@ -82,7 +130,6 @@ client.on('messageCreate', async message => {
     }
 
     if (message.mentions.has(client.user.id)) {
-        // Special handling when the bot is mentioned
         const currentTime = Date.now();
         const timeElapsed = currentTime - lastResponseTime;
 
@@ -91,37 +138,45 @@ client.on('messageCreate', async message => {
 
             const userMessage = { role: "user", content: `${message.author.username}: ${message.content}` };
             const fetchedResponse = await fetchOpenAIResponse([userMessage], message.channelId);
-            console.log("Fetched response: ", fetchedResponse); // Log the fetched response
+            console.log("Fetched response: ", fetchedResponse);
 
-        const { commands, restOfResponse } = processResponse(fetchedResponse);
+            const { commands, restOfResponse } = processResponse(fetchedResponse);
 
-        for (const { command, commandArgs } of commands) {
-            console.log(`Executing command: ${command} with arguments: ${commandArgs.join(" ")}`);
-            const commandToExecute = client.commands.get(command.toLowerCase());
-            if (commandToExecute) {
+            if (restOfResponse) {
                 try {
-                    // Properly format arguments for the play command
-                    const formattedArgs = formatArgumentsForCommand(command, commandArgs);
-                    await commandToExecute.execute(message, formattedArgs, client);
-                    await new Promise(resolve => setTimeout(resolve, 1000)); // Delay of 1 second
+                    const voiceChannelId = message.member.voice.channel ? message.member.voice.channel.id : null;
+                    if (!voiceChannelId) {
+                        await message.reply("You need to be in a voice channel for me to speak.");
+                        return;
+                    }
+
+                    await playTTSMessage(client, guildId, restOfResponse, voiceChannelId, serverQueue);
+
+              
                 } catch (error) {
-                    console.error(error);
-                    await message.reply(`There was an error trying to execute the ${command} command!`);
+                    console.error('Error with TTS:', error);
+                    await message.reply('Sorry, I had trouble speaking the response.');
                 }
             }
-        }
 
-
-            // Send the rest of the response as a message
-            if (restOfResponse) {
-                await message.reply(restOfResponse);
+            for (const { command, commandArgs } of commands) {
+                const commandToExecute = client.commands.get(command.toLowerCase());
+                if (commandToExecute) {
+                    try {
+                        const formattedArgs = formatArgumentsForCommand(command, commandArgs);
+                        await commandToExecute.execute(message, formattedArgs, client);
+                    } catch (error) {
+                        console.error(error);
+                        await message.reply(`There was an error trying to execute the ${command} command!`);
+                    }
+                }
             }
         } else {
             await message.reply(`Busy messing with equipment. Give me a sec and let me know what I can do to help! <3`);
         }
     }
-    // Additional handling for other types of messages can be added here
 });
+
 
 
 function processResponse(response) {
@@ -197,6 +252,93 @@ function formatArgumentsForCommand(command, args) {
     }
     return args;
 }
+
+async function elevenLabsTTS(text) {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM/stream`; // Replace with your voice ID
+    const requestOptions = {
+        method: 'POST',
+        headers: {
+            'xi-api-key': process.env.ELEVENLABS_API_KEY,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            model_id: "eleven_multilingual_v2", // Replace with your model id
+            text: text,
+            voice_settings: {
+                similarity_boost: 1,
+                stability: 1,
+                style: 1,
+                use_speaker_boost: true
+            }
+        })
+    };
+
+    const response = await fetch(url, requestOptions);
+    const buffer = await response.arrayBuffer();
+    return buffer;
+}
+
+async function playTTSMessage(client, guildId, message, voiceChannelId) {
+    console.log("Preparing to play TTS message");
+
+    // Check and join the voice channel if not connected
+    let serverQueue = client.queue.get(guildId);
+    if (!serverQueue || !serverQueue.connection) {
+        if (!voiceChannelId) {
+            console.error("No voice channel ID provided");
+            return;
+        }
+
+        const voiceChannel = client.channels.cache.get(voiceChannelId);
+        if (!voiceChannel) {
+            console.error("Voice channel not found");
+            return;
+        }
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannelId,
+            guildId: guildId,
+            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+        });
+
+        // Update or initialize serverQueue
+        serverQueue = serverQueue || {
+            songs: [],
+            history: [],
+            connection: connection,
+            player: createAudioPlayer(), // Assuming you have a function to create or get an AudioPlayer
+            playing: true,
+            client: client
+        };
+        client.queue.set(guildId, serverQueue);
+    }
+
+    const buffer = await elevenLabsTTS(message);
+    const readableStream = new Readable();
+    readableStream._read = () => {};
+    readableStream.push(Buffer.from(buffer));
+    readableStream.push(null);
+
+    const resource = createAudioResource(readableStream, { inputType: StreamType.Arbitrary });
+    
+    if (!serverQueue.player) {
+        console.error("Server queue does not have a valid player");
+        return;
+    }
+
+    console.log("Playing TTS message");
+    serverQueue.player.play(resource);
+    return new Promise((resolve) => {
+        serverQueue.player.once(AudioPlayerStatus.Idle, () => {
+            console.log("TTS message playback finished");
+            resolve();
+        });
+    });
+}
+
+
+module.exports = playTTSMessage;
+
 
 // Login to Discord with your app's token
 client.login(process.env.DISCORD_TOKEN);
