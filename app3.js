@@ -4,13 +4,13 @@ const fs = require('fs');
 const fsp = fs.promises;
 const allowedChannels = ['Frequency Funhouse'];
 require('dotenv').config();
-const { SlashCommandBuilder } = require('@discordjs/builders');
 const testevent = require('./events/testevent');
 const path = require('path');
 const { scheduleYouTubePlayback } = require('./events/testevent');
 const { Readable } = require('stream');
 const { playSong, playDownloadedSong, handleEmptyQueue } = require('./commands/play');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
+
 
 
 
@@ -33,29 +33,52 @@ const client = new Client({
 
 // Initialize client.queue here
 client.queue = new Map();
-
+global.lastPlayedSong = null;
 client.isFetchingOpenAIPlaylist = false;
 client.recentlyPlayed = [];
 client.commands = new Collection();
 
 client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}!`);
- });
+
+    // Load and execute the test event immediately for testing
+    const testEvent = require('./events/testevent');
+    testEvent.execute(client);
+});
 
 
 
-// Load prefix-based (!command) commands
+
+// Initialize the recently played songs log
+client.recentlyPlayed = [];
+
+// Command collection
+client.commands = new Collection();
+
+// Load commands
 const commandFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'));
 
 for (const file of commandFiles) {
+    console.log(`Loading command file: ${file}`);
     const command = require(`./commands/${file}`);
-    // Check if command has 'name' property or 'data.name' property
-    if (command.name) {
-        client.commands.set(command.name, command);
-    } else if (command.data && command.data.name) {
-        client.commands.set(command.data.name, command);
+
+    // Check if the export is a function or has an 'execute' method
+    if (typeof command === 'function' || command.execute) {
+        // Determine the command name
+        const commandName = command.name || (command.data && command.data.name);
+
+        // Log details about the command structure
+        console.log(`Loaded command structure:`, command);
+        console.log(`Command name determined as: ${commandName}`);
+
+        if (commandName) {
+            console.log(`Registering command: ${commandName}`);
+            client.commands.set(commandName, command);
+        } else {
+            console.error(`Command file ${file} is missing a name property.`);
+        }
     } else {
-        console.error(`Command file ${file} is not properly formatted.`);
+        console.error(`Command file ${file} does not export a valid structure.`);
     }
 }
 
@@ -71,25 +94,14 @@ for (const file of eventFiles) {
     }
 }
 
-// Handle interactionCreate event for slash commands
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isCommand()) return;
-    const command = client.commands.get(interaction.commandName);
-    if (!command) return;
-
-    try {
-        await command.execute(interaction, client);
-    } catch (error) {
-        console.error(error);
-        await interaction.reply({ content: 'There was an error executing this command!', ephemeral: true });
-    }
-});
-
 // Additional variables from the new script
 const recentMessages = new Map();
 const maxMessages = 10;
 const cooldown = 60000;
 let lastResponseTime = 0;
+
+
+
 
 client.on('messageCreate', async message => {
     const guildId = process.env.GUILD_ID || message.guild.id; // Use guild ID from .env file or fallback to message.guild.id
